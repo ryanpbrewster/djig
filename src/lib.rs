@@ -1,6 +1,14 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    fmt::Error,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-use tokio::sync::{mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender}, oneshot};
+use anyhow::bail;
+use thiserror::Error;
+use tokio::sync::{
+    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    oneshot,
+};
 use tracing::debug;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -18,92 +26,125 @@ impl Ballot {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct State(pub u16);
 
-
+#[derive(Clone)]
 pub struct Proposer {
     tx: UnboundedSender<ProposerCommand>,
 }
 pub struct MyProposer {
-    ballot:    Ballot,
+    ballot: Ballot,
     acceptors: Vec<Acceptor>,
 }
 #[derive(Debug)]
 pub enum ProposerCommand {
     Cas {
-        out: oneshot::Sender<CasResult>,
+        out: oneshot::Sender<anyhow::Result<()>>,
         cur: State,
         next: State,
     },
-    Read { 
-        out: oneshot::Sender<Stamp>,
+    Read {
+        out: oneshot::Sender<anyhow::Result<Stamp>>,
     },
 }
-type CasResult = Result<(), Stamp>;
 
 static PROPOSER_ID: AtomicU64 = AtomicU64::new(1);
 impl MyProposer {
-    pub async fn run(mut self, mut rx: UnboundedReceiver<ProposerCommand>) {
-        debug!(?self.ballot.id, "starting proposer");
-        while let Some(cmd) = rx.recv().await {
-            debug!(?cmd, "recv");
-            let b = self.ballot.inc();
-            match cmd {
-                ProposerCommand::Cas { out, cur: expected, next: target } => {
-                     // TODO: could be implemented as `transform { x => x == cur ? next : throw x }`
-
-                     // TODO: do in parallel, tolerate failures
-                     let mut prepares = Vec::with_capacity(self.acceptors.len());
-                     for a in &self.acceptors {
-                        prepares.push(a.propose(b).await.expect("TODO: handle failed nodes").expect("TODO: handle conflicts"));
-                     }
-                     let cur = prepares.into_iter().max_by_key(|r| r.ballot).expect("at least one acceptor");
-                     debug_assert!(b > cur.ballot);
-                     let resp = if cur.state != expected {
-                        Err(cur)
-                     } else {
-                        for a in &self.acceptors {
-                            a.accept(b, target.clone()).await.expect("TODO: handle failed nodes").expect("TODO: handle conflicts");
-                        }
-                        Ok(())
-                    };
-                    let _ = out.send(resp);
-                }
-                ProposerCommand::Read { out }=> {
-                    // TODO: could be implemented as `transform { x => x }`
-                     let mut prepares = Vec::with_capacity(self.acceptors.len());
-                     for a in &self.acceptors {
-                        prepares.push(a.propose(b).await.expect("TODO: handle failed nodes").expect("TODO: handle conflicts"));
-                     }
-                     let cur = prepares.into_iter().max_by_key(|r| r.ballot).expect("at least one acceptor");
-                     let _ = out.send(cur);
-                }
-            }
-        }
-    }
     pub fn start(acceptors: Vec<Acceptor>) -> Proposer {
         let (tx, rx) = unbounded_channel();
         let actor = MyProposer {
-            ballot: Ballot { id: PROPOSER_ID.fetch_add(1, Ordering::SeqCst), counter: 0 },
+            ballot: Ballot {
+                id: PROPOSER_ID.fetch_add(1, Ordering::SeqCst),
+                counter: 0,
+            },
             acceptors,
         };
         tokio::spawn(actor.run(rx));
         Proposer { tx }
     }
+    async fn run(mut self, mut rx: UnboundedReceiver<ProposerCommand>) {
+        debug!(?self.ballot.id, "starting proposer");
+        while let Some(cmd) = rx.recv().await {
+            debug!(?cmd, "recv");
+            match cmd {
+                ProposerCommand::Cas {
+                    out,
+                    cur: expected,
+                    next: target,
+                } => {
+                    let resp = self
+                        .process(|stamp| {
+                            if stamp.state == expected {
+                                Ok(target)
+                            } else {
+                                Err(ProtocolError::CasMismatch { found: stamp })
+                            }
+                        })
+                        .await;
+                    let _ = out.send(resp.map(|_| ()));
+                }
+                ProposerCommand::Read { out } => {
+                    let resp = self.process(|stamp| Ok(stamp.state)).await;
+                    let _ = out.send(resp);
+                }
+            };
+        }
+    }
+    async fn process(
+        &mut self,
+        f: impl FnOnce(Stamp) -> ProtocolResult<State>,
+    ) -> anyhow::Result<Stamp> {
+        let b = self.ballot.inc();
+        let mut prepares = Vec::with_capacity(self.acceptors.len());
+        // TODO: do in parallel, tolerate failures
+        for a in &self.acceptors {
+            match a.propose(b).await? {
+                Ok(v) => prepares.push(v),
+                Err(e) => return Err(ProtocolError::PrepareConflict { ballot: e }.into()),
+            };
+        }
+        let cur = prepares
+            .into_iter()
+            .max_by_key(|r| r.ballot)
+            .expect("at least one acceptor");
+        debug_assert!(b > cur.ballot);
+        let next = f(cur)?;
+        // TODO: do in parallel, tolerate failures
+        for a in &self.acceptors {
+            if let Err(e) = a.accept(b, next.clone()).await? {
+                return Err(ProtocolError::AcceptConflict { ballot: e }.into());
+            }
+        }
+        Ok(Stamp {
+            state: next,
+            ballot: b,
+        })
+    }
 }
+#[derive(Debug, Error, PartialEq, Eq)]
+enum ProtocolError {
+    #[error("CAS mismatch, ({found:?})")]
+    CasMismatch { found: Stamp },
+    #[error("Prepare conflict, ({ballot:?})")]
+    PrepareConflict { ballot: Ballot },
+    #[error("Accept conflict, ({ballot:?})")]
+    AcceptConflict { ballot: Ballot },
+}
+type ProtocolResult<T> = Result<T, ProtocolError>;
 impl Proposer {
-    pub async fn cas(&self, cur: State, next: State) -> anyhow::Result<CasResult> {
+    pub async fn cas(&self, cur: State, next: State) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(ProposerCommand::Cas { cur, next, out: tx })?;
-        Ok(rx.await?)
+        self.tx.send(ProposerCommand::Cas { cur, next, out: tx })?;
+        Ok(rx.await??)
     }
     pub async fn read(&self) -> anyhow::Result<Stamp> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(ProposerCommand::Read { out: tx })?;
-        Ok(rx.await?)
+        self.tx.send(ProposerCommand::Read { out: tx })?;
+        Ok(rx.await??)
     }
 }
 
+#[derive(Clone)]
 pub struct Acceptor {
-    tx: UnboundedSender<AcceptorCommand>
+    tx: UnboundedSender<AcceptorCommand>,
 }
 pub struct MyAcceptor {
     pub state: State,
@@ -135,7 +176,10 @@ impl MyAcceptor {
                         Err(b)
                     } else {
                         self.promise = Some(ballot);
-                        Ok(Stamp { state: self.state.clone(), ballot: self.accepted })
+                        Ok(Stamp {
+                            state: self.state.clone(),
+                            ballot: self.accepted,
+                        })
                     };
                     let _ = out.send(resp);
                 }
@@ -172,7 +216,11 @@ impl Acceptor {
     }
     pub async fn accept(&self, ballot: Ballot, state: State) -> anyhow::Result<AcceptResult> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(AcceptorCommand::Accept { out: tx, ballot, state });
+        let _ = self.tx.send(AcceptorCommand::Accept {
+            out: tx,
+            ballot,
+            state,
+        });
         Ok(rx.await?)
     }
 }
@@ -183,7 +231,6 @@ pub struct Stamp {
 }
 pub type PrepareResult = Result<Stamp, Ballot>;
 pub type AcceptResult = Result<(), Ballot>;
-
 
 #[cfg(test)]
 mod tests {
@@ -196,10 +243,48 @@ mod tests {
         let a3 = MyAcceptor::start(State(42));
         let p = MyProposer::start(vec![a1, a2, a3]);
 
-        assert_eq!(p.read().await?.state, State(42));
-        assert_eq!(p.cas(State(42), State(1984)).await?, Ok(()));
-        assert_eq!(p.read().await?.state, State(1984));
-        assert_eq!(p.cas(State(42), State(1984)).await?, Err(Stamp { state: State(1984), ballot: Ballot::ZERO }));
+        // We can read
+        let r = p.read().await?;
+        assert_eq!(r.state, State(42));
+        // We can write
+        p.cas(State(42), State(1984)).await?;
+        // We can read our writes
+        let r = p.read().await?;
+        assert_eq!(r.state, State(1984));
+        // Writes with a mismatched ETag are rejected
+        let err = p
+            .cas(State(42), State(1984))
+            .await
+            .expect_err("cas mismatch");
+        assert_eq!(
+            err.downcast::<ProtocolError>().unwrap(),
+            ProtocolError::CasMismatch { found: r }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proposers_handle_conflicts() -> anyhow::Result<()> {
+        let a1 = MyAcceptor::start(State(1));
+        let a2 = MyAcceptor::start(State(1));
+        let a3 = MyAcceptor::start(State(1));
+        let p1 = MyProposer::start(vec![a1.clone(), a2.clone(), a3.clone()]);
+        let p2 = MyProposer::start(vec![a1.clone(), a2.clone(), a3.clone()]);
+
+        // Perform two writes from p1
+        p1.cas(State(1), State(2)).await?;
+        p1.cas(State(2), State(3)).await?;
+
+        // Perform a write from p2
+        let err = p2
+            .cas(State(3), State(4))
+            .await
+            .expect_err("expecting a prepare conflict");
+        assert!(matches!(
+            err.downcast::<ProtocolError>().unwrap(),
+            ProtocolError::PrepareConflict { .. }
+        ));
+
         Ok(())
     }
 }
