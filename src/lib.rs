@@ -1,9 +1,5 @@
-use std::{
-    fmt::Error,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::bail;
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
@@ -133,12 +129,12 @@ impl Proposer {
     pub async fn cas(&self, cur: State, next: State) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(ProposerCommand::Cas { cur, next, out: tx })?;
-        Ok(rx.await??)
+        rx.await?
     }
     pub async fn read(&self) -> anyhow::Result<Stamp> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(ProposerCommand::Read { out: tx })?;
-        Ok(rx.await??)
+        rx.await?
     }
 }
 
