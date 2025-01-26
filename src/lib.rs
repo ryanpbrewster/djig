@@ -1,5 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    future::Future,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
+use futures::{stream::FuturesUnordered, StreamExt};
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
@@ -89,31 +93,71 @@ impl MyProposer {
         f: impl FnOnce(Stamp) -> ProtocolResult<State>,
     ) -> anyhow::Result<Stamp> {
         let b = self.ballot.inc();
-        let mut prepares = Vec::with_capacity(self.acceptors.len());
-        // TODO: do in parallel, tolerate failures
-        for a in &self.acceptors {
-            match a.propose(b).await? {
-                Ok(v) => prepares.push(v),
-                Err(e) => return Err(ProtocolError::PrepareConflict { ballot: e }.into()),
-            };
-        }
-        let cur = prepares
+        let quorum_size = self.acceptors.len() / 2 + 1;
+
+        let prepares: FuturesUnordered<_> = self
+            .acceptors
+            .iter()
+            .map(|a| async {
+                match a.propose(b).await {
+                    Ok(Ok(stamp)) => Ok(stamp),
+                    Ok(Err(conflict)) => Err(Some(conflict)),
+                    Err(_) => Err(None),
+                }
+            })
+            .collect();
+        let prepare_results = collect_quorum(quorum_size, prepares)
+            .await
+            .map_err(|es| match es.into_iter().flatten().max() {
+                Some(conflict) => ProtocolError::PrepareConflict { ballot: conflict },
+                None => ProtocolError::PrepareUnavailable,
+            })?;
+        let cur = prepare_results
             .into_iter()
             .max_by_key(|r| r.ballot)
             .expect("at least one acceptor");
         debug_assert!(b > cur.ballot);
         let next = f(cur)?;
-        // TODO: do in parallel, tolerate failures
-        for a in &self.acceptors {
-            if let Err(e) = a.accept(b, next.clone()).await? {
-                return Err(ProtocolError::AcceptConflict { ballot: e }.into());
+        let accepts: FuturesUnordered<_> = self
+            .acceptors
+            .iter()
+            .map(|a| async {
+                match a.accept(b, next.clone()).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(conflict)) => Err(Some(conflict)),
+                    Err(_) => Err(None),
+                }
+            })
+            .collect();
+        collect_quorum(quorum_size, accepts).await.map_err(|es| {
+            match es.into_iter().flatten().max() {
+                Some(conflict) => ProtocolError::AcceptConflict { ballot: conflict },
+                None => ProtocolError::AcceptUnavailable,
             }
-        }
+        })?;
         Ok(Stamp {
             state: next,
             ballot: b,
         })
     }
+}
+
+async fn collect_quorum<T, E, F>(q: usize, mut fs: FuturesUnordered<F>) -> Result<Vec<T>, Vec<E>>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let mut ok = Vec::with_capacity(q);
+    let mut errs = Vec::new();
+    while let Some(r) = fs.next().await {
+        match r {
+            Ok(v) => ok.push(v),
+            Err(e) => errs.push(e),
+        };
+        if ok.len() >= q {
+            return Ok(ok);
+        }
+    }
+    Err(errs)
 }
 #[derive(Debug, Error, PartialEq, Eq)]
 enum ProtocolError {
@@ -121,8 +165,12 @@ enum ProtocolError {
     CasMismatch { found: Stamp },
     #[error("Prepare conflict, ({ballot:?})")]
     PrepareConflict { ballot: Ballot },
+    #[error("Not enough responses to our prepare requests")]
+    PrepareUnavailable,
     #[error("Accept conflict, ({ballot:?})")]
     AcceptConflict { ballot: Ballot },
+    #[error("Not enough responses to our accept requests")]
+    AcceptUnavailable,
 }
 type ProtocolResult<T> = Result<T, ProtocolError>;
 impl Proposer {
@@ -280,6 +328,32 @@ mod tests {
             err.downcast::<ProtocolError>().unwrap(),
             ProtocolError::PrepareConflict { .. }
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tolerates_single_failure() -> anyhow::Result<()> {
+        // Create 3 acceptors, one of which will fail
+        let a1 = MyAcceptor::start(State(42));
+        let a2 = MyAcceptor::start(State(42));
+        let a3_fails = {
+            let (tx, _rx) = unbounded_channel(); // Dropped receiver causes send to fail
+            Acceptor { tx }
+        };
+
+        let p = MyProposer::start(vec![a1, a2, a3_fails]);
+
+        // This should succeed despite one failed acceptor
+        let r = p.read().await?;
+        assert_eq!(r.state, State(42));
+
+        // Should be able to write with one failed acceptor
+        p.cas(State(42), State(1984)).await?;
+
+        // And read our write
+        let r = p.read().await?;
+        assert_eq!(r.state, State(1984));
 
         Ok(())
     }
